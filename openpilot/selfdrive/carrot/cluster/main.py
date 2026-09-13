@@ -930,10 +930,7 @@ def run_demo(
     simulator = ClusterSimulator() if input_mode in ("random", "gamepad") else None
     controller = DualSenseSimulator(controller_index) if input_mode == "gamepad" else None
     random_input = RandomInputSource() if input_mode == "random" else None
-    live_source = OpenpilotLiveSource(
-        include_can=live_include_can or active_screen_mode == normalize_cluster_screen_mode("my-hud"),  # my-hud decodes raw CAN
-        timeout_ms=live_timeout_ms,
-    ) if input_mode == "live" else None
+    live_source = OpenpilotLiveSource(include_can=live_include_can, timeout_ms=live_timeout_ms) if input_mode == "live" else None
     navi_source = None
     if input_mode == "navi" or navi_overlay_enabled:
         from cluster_navi_source import NaviSimulatorSource
@@ -1253,14 +1250,6 @@ def run_demo(
                         f"{CLUSTER_SCREEN_MODE_PARAM} updated: {renderer.screen_mode} -> {next_screen_mode}",
                         flush=True,
                     )
-                    if (
-                        live_source is not None
-                        and hud_mode_watch is not None
-                        and next_screen_mode == normalize_cluster_screen_mode("my-hud")
-                        and "can" not in live_source.services
-                    ):
-                        print("my-hud needs raw CAN; exiting for restart", flush=True)
-                        break
                     renderer.set_screen_mode(next_screen_mode)
                     if live_source is not None:
                         live_source.set_debug_panels_enabled(

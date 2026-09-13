@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,9 +34,8 @@ CAN_SIGNALS: dict[int, tuple[str, ...]] = {
     0x220: ("CYL_PRES",),
     0x50B: ("OPKR_EV_Charge_Level",),
 }
-# Live SubMaster keeps only the newest `can` message per HUD frame, so 10 Hz frames
-# such as 0x50B are seen intermittently; hold values a little longer than their period.
-CAN_STALE_S = 3.0
+CAN_STALE_S = 1.0
+LIVE_CAN_IDLE_S = 2.0  # stop draining raw CAN this long after the my-hud screen was last drawn
 SERVICE_STALE_S = 5.0
 RPM_BAR_MAX = 6000.0
 BRAKE_BAR_MAX = 10.0
@@ -55,6 +55,9 @@ GAS_COLOR = (90, 214, 190)
 BRAKE_COLOR = (255, 91, 79)
 WARN_COLOR = (240, 164, 58)
 BLINK_COLOR = (57, 226, 106)
+
+# Updated by draw_my_hud so live telemetry only drains raw CAN while this screen is visible.
+_screen_state = {"last_draw": 0.0}
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +180,45 @@ class MyHudTelemetry:
         self._signals = load_can_signals()
         self._can: dict[str, tuple[float, float]] = {}
         self._values: dict[str, tuple[float | None, float]] = {}
+        self._messaging: Any = None
+        self._can_sock: Any = None
+        self._can_unavailable = False
+
+    def update_live(self, sm: Any) -> None:
+        """Feed from the live SubMaster; drain raw CAN on a dedicated socket while my-hud is shown.
+
+        `can` deliberately stays out of the SubMaster: it reads one message per update, which lags far
+        behind 100 Hz `can`, and it would also run the CAN-FD corner-radar parser on this car's
+        bus-1 radar frames (0x238-0x248 overlap its address range).
+        """
+        for service in ("radarState", "deviceState", "peripheralState"):
+            try:
+                if service in sm.services and sm.updated[service]:
+                    self.observe(service, sm[service], sm.logMonoTime[service] / 1e9)
+            except Exception:
+                pass
+
+        if self._can_unavailable:
+            return
+        if time.monotonic() - _screen_state["last_draw"] > LIVE_CAN_IDLE_S:
+            self._can_sock = None  # another screen is active: stop paying for raw CAN
+            return
+        if self._messaging is None:
+            try:
+                import openpilot.cereal.messaging as messaging
+            except Exception as exc:
+                self._can_unavailable = True
+                print(f"[my-hud] cereal messaging unavailable; CAN metrics disabled: {exc}", flush=True)
+                return
+            self._messaging = messaging
+        try:
+            if self._can_sock is None:
+                self._can_sock = self._messaging.sub_sock("can", conflate=False, timeout=0)
+            for event in self._messaging.drain_sock(self._can_sock):
+                self._observe_can(event.can, event.logMonoTime / 1e9)
+        except Exception as exc:
+            self._can_sock = None  # recreate on the next frame
+            print(f"[my-hud] raw CAN read failed: {exc}", flush=True)
 
     def observe(self, service: str, msg: Any, event_t: float) -> None:
         if msg is None:
@@ -482,6 +524,7 @@ def _draw_status_row(r: Any, state: Any, snap: MyHudSnapshot) -> None:
 
 
 def draw_my_hud(r: Any, state: Any, signal_lights: tuple[bool, bool]) -> None:
+    _screen_state["last_draw"] = time.monotonic()
     snap = getattr(state, "my_hud", None) or MyHudSnapshot()
     rl.clear_background(_c(BG))
     rl.rl_push_matrix()

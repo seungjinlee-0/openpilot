@@ -302,6 +302,7 @@ class OpenpilotLiveSource:
             event_t = self._service_time(service)
             self._apply_service_update(service, event_t)
         self._profile_add("source.live.apply_updates", profile_stage)
+        self.parser.my_hud.update_live(self.sm)
 
         onroad_state = self.onroad_state()
         if onroad_state is not None:
@@ -592,8 +593,6 @@ class OpenpilotLiveSource:
 
     def _apply_service_update(self, service: str, event_t: float) -> None:
         data = self.sm[service]
-        if service in self.parser.my_hud.LIVE_SERVICES:
-            self.parser.my_hud.observe(service, data, event_t)
         if service == "drivingModelData":
             self.parser._update_driving_model(data)
         elif service == "modelV2":
