@@ -1460,6 +1460,11 @@ class ClusterUiRenderer:
         """Draw one frame into the currently active raylib render target."""
         if signal_lights is None:
             signal_lights = self._turn_signal_lights(state)
+        from cluster_my_hud import MY_HUD_SCREEN_MODE, draw_my_hud
+        if self.screen_mode == MY_HUD_SCREEN_MODE:
+            draw_my_hud(self, state, signal_lights)
+            self._draw_alert_overlay(getattr(state, "alert", None))
+            return
         profile_stage = self._profile_start()
         if self.screen_mode in (CLUSTER_SCREEN_MODE_DEBUG_GRAPH, CLUSTER_SCREEN_MODE_NAVI):
             self._clear_world()

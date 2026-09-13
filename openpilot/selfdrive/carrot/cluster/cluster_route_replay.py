@@ -530,6 +530,7 @@ class RouteReplayFrame:
     radar_points: tuple[RadarPoint, ...] = ()
     corner_radar_supported: bool = False
     tpms: TpmsInfo = TpmsInfo()
+    my_hud: Any = None  # cluster_my_hud.MyHudSnapshot
     ev_mode_valid: bool = False
     ev_mode_active: bool = False
     display_speed_kph: float | None = None
@@ -1618,6 +1619,8 @@ class RouteLogParser:
         self.radar_detection_t = -999.0
         self.current_speed_kph = 0.0
         self.v_ego_cluster_seen = False
+        from cluster_my_hud import MyHudTelemetry
+        self.my_hud = MyHudTelemetry()
 
     def parse_file(self, file_path: Path, log_schema: Any) -> list[RouteReplayFrame]:
         frames: list[RouteReplayFrame] = []
@@ -1632,6 +1635,8 @@ class RouteLogParser:
             if event_type is None:
                 continue
             event_t = float(getattr(event, "logMonoTime", 0)) / 1_000_000_000.0
+            if event_type in self.my_hud.LIVE_SERVICES:
+                self.my_hud.observe(event_type, getattr(event, event_type), event_t)
             if event_type == "carState":
                 frames.append(self._frame_from_car_state(event.carState, event_t))
             elif event_type == "drivingModelData":
@@ -1811,6 +1816,7 @@ class RouteLogParser:
             radar_points=radar_points,
             corner_radar_supported=self.corner_radar_active_for_display(),
             tpms=tpms,
+            my_hud=self.my_hud.snapshot(car_state, event_t),
             ev_mode_valid=ev_mode_valid,
             ev_mode_active=ev_mode_active,
             display_speed_kph=display_speed_kph,
@@ -3784,6 +3790,7 @@ def frame_to_state(frame: RouteReplayFrame) -> ClusterUiState:
         radar_points=frame.radar_points,
         corner_radar_supported=frame.corner_radar_supported,
         tpms=frame.tpms,
+        my_hud=frame.my_hud,
         ev_mode_valid=frame.ev_mode_valid,
         ev_mode_active=frame.ev_mode_valid and frame.ev_mode_active,
         planned_speed_kph=frame.planned_speed_kph,
@@ -3998,6 +4005,7 @@ def blend_frames(left: RouteReplayFrame, right: RouteReplayFrame, amount: float)
         radar_points=discrete.radar_points,
         corner_radar_supported=discrete.corner_radar_supported,
         tpms=discrete.tpms,
+        my_hud=discrete.my_hud,
         ev_mode_valid=discrete.ev_mode_valid,
         ev_mode_active=discrete.ev_mode_valid and discrete.ev_mode_active,
         planned_speed_kph=lerp_optional(left.planned_speed_kph, right.planned_speed_kph),

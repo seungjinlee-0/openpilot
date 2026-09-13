@@ -410,6 +410,7 @@ class ClusterUiState:
     radar_points: tuple[RadarPoint, ...] = ()
     corner_radar_supported: bool = False
     tpms: TpmsInfo = TpmsInfo()
+    my_hud: object | None = None  # cluster_my_hud.MyHudSnapshot
     radar_info_mode: int = 4
     radar_display_mode: int = 0
     radar_source_color_mode: int = 0

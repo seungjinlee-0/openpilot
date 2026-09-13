@@ -459,6 +459,7 @@ def normalize_cluster_screen_mode(value: object) -> int:
             "driving_report": CLUSTER_SCREEN_MODE_TRIP_REPORT,
             "navi": CLUSTER_SCREEN_MODE_NAVI,
             "navigation": CLUSTER_SCREEN_MODE_NAVI,
+            "my-hud": 7,  # cluster_my_hud.MY_HUD_SCREEN_MODE
         }
         if normalized in aliases:
             return aliases[normalized]
@@ -479,6 +480,7 @@ def normalize_cluster_screen_mode(value: object) -> int:
         CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
         CLUSTER_SCREEN_MODE_TRIP_REPORT,
         CLUSTER_SCREEN_MODE_NAVI,
+        7,  # cluster_my_hud.MY_HUD_SCREEN_MODE
     ):
         return mode
     return CLUSTER_SCREEN_MODE_DEFAULT

@@ -90,6 +90,7 @@ LIVE_SERVICES_BASE = (
     "carControl",
     "carOutput",
     "deviceState",
+    "peripheralState",
     "roadCameraState",
     "cameraOdometry",
     "liveCalibration",
@@ -591,6 +592,8 @@ class OpenpilotLiveSource:
 
     def _apply_service_update(self, service: str, event_t: float) -> None:
         data = self.sm[service]
+        if service in self.parser.my_hud.LIVE_SERVICES:
+            self.parser.my_hud.observe(service, data, event_t)
         if service == "drivingModelData":
             self.parser._update_driving_model(data)
         elif service == "modelV2":
