@@ -42,6 +42,11 @@ BRAKE_BAR_MAX = 10.0
 TPMS_LOW_PSI = 31.0
 CPU_TEMP_WARN_C = 75.0
 CPU_TEMP_CRIT_C = 90.0
+REGEN_MIN_SPEED_MPS = 1.5  # regen fades out below ~5 km/h
+REGEN_MIN_DECEL_MPS2 = -0.25
+REGEN_HOLD_S = 0.6  # keep the charge mark steady between samples
+REGEN_BAR_MAX_MPS2 = 3.0  # deceleration that fills the regen bar
+CRUISE_ACCEL_MAX_MPS2 = 2.0  # requested acceleration that fills the accel bar under cruise
 
 BG = (4, 7, 10)
 INK = (233, 241, 239)
@@ -55,6 +60,8 @@ GAS_COLOR = (90, 214, 190)
 BRAKE_COLOR = (255, 91, 79)
 WARN_COLOR = (240, 164, 58)
 BLINK_COLOR = (57, 226, 106)
+REGEN_COLOR = (60, 255, 120)
+BAR_OUTLINE = (54, 70, 66)
 
 # Updated by draw_my_hud so live telemetry only drains raw CAN while this screen is visible.
 _screen_state = {"last_draw": 0.0}
@@ -68,11 +75,13 @@ class MyHudSnapshot:
     brake_pressure_bar: float | None = None
     gas_percent: float | None = None
     lead_distance_m: float | None = None
+    decel_mps2: float | None = None
     hv_soc_percent: float | None = None
+    regen_charging: bool = False
     battery_voltage_v: float | None = None
-    power_draw_w: float | None = None
+    fan_rpm: float | None = None
     cpu_temp_c: float | None = None
-    gpu_temp_c: float | None = None
+    drive_seconds: float | None = None
     cpu_usage_percent: float | None = None
     memory_used_percent: float | None = None
     disk_used_percent: float | None = None
@@ -183,6 +192,7 @@ class MyHudTelemetry:
         self._messaging: Any = None
         self._can_sock: Any = None
         self._can_unavailable = False
+        self._regen_until = 0.0
 
     def update_live(self, sm: Any) -> None:
         """Feed from the live SubMaster; drain raw CAN on a dedicated socket while my-hud is shown.
@@ -231,17 +241,18 @@ class MyHudTelemetry:
                 self._values["lead"] = (_finite(lead.dRel) if lead.status else None, event_t)
             elif service == "deviceState":
                 cpu_temps = _list_values(msg.cpuTempC)
-                gpu_temps = _list_values(msg.gpuTempC)
                 cpu_usage = _list_values(msg.cpuUsagePercent)
                 free = _finite(msg.freeSpacePercent)
                 self._values["cpu_temp"] = (max(cpu_temps) if cpu_temps else None, event_t)
-                self._values["gpu_temp"] = (max(gpu_temps) if gpu_temps else None, event_t)
+                started = bool(getattr(msg, "started", False))
+                started_t = _finite(getattr(msg, "startedMonoTime", None))
+                self._values["drive_start"] = (started_t / 1e9 if started and started_t else None, event_t)
                 self._values["cpu_usage"] = (sum(cpu_usage) / len(cpu_usage) if cpu_usage else None, event_t)
                 self._values["memory"] = (_finite(msg.memoryUsagePercent), event_t)
                 self._values["disk"] = (100.0 - free if free is not None else None, event_t)
-                self._values["power"] = (_finite(msg.powerDrawW), event_t)
             elif service == "peripheralState":
                 millivolts = _finite(msg.voltage)
+                self._values["fan_rpm"] = (_finite(getattr(msg, "fanSpeedRpm", None)), event_t)
                 self._values["voltage"] = (millivolts / 1000.0 if millivolts else None, event_t)
         except Exception:
             # A schema mismatch must never take the HUD down; the value just goes stale.
@@ -274,7 +285,15 @@ class MyHudTelemetry:
 
     def snapshot(self, car_state: Any, event_t: float) -> MyHudSnapshot:
         engine_run = self._fresh_can("Engine_Run", event_t)
+        drive_start = self._fresh("drive_start", event_t)
         gas = _finite(getattr(car_state, "gas", None))
+        # No battery current on this car's buses, so regen is inferred from the driving state:
+        # pedal released and still decelerating above walking pace.
+        v_ego = _finite(getattr(car_state, "vEgo", None))
+        a_ego = _finite(getattr(car_state, "aEgo", None))
+        if (not getattr(car_state, "gasPressed", False) and v_ego is not None and a_ego is not None
+                and v_ego > REGEN_MIN_SPEED_MPS and a_ego < REGEN_MIN_DECEL_MPS2):
+            self._regen_until = event_t + REGEN_HOLD_S
         return MyHudSnapshot(
             engine_rpm=self._fresh_can("N", event_t),
             engine_running=None if engine_run is None else engine_run >= 0.5,
@@ -282,11 +301,13 @@ class MyHudTelemetry:
             brake_pressure_bar=self._fresh_can("CYL_PRES", event_t),
             gas_percent=None if gas is None else max(0.0, min(100.0, gas * 100.0)),
             lead_distance_m=self._fresh("lead", event_t),
+            decel_mps2=a_ego,
             hv_soc_percent=self._fresh_can("OPKR_EV_Charge_Level", event_t),
+            regen_charging=event_t < self._regen_until,
             battery_voltage_v=self._fresh("voltage", event_t),
-            power_draw_w=self._fresh("power", event_t),
+            fan_rpm=self._fresh("fan_rpm", event_t),
             cpu_temp_c=self._fresh("cpu_temp", event_t),
-            gpu_temp_c=self._fresh("gpu_temp", event_t),
+            drive_seconds=(event_t - drive_start) if drive_start is not None and event_t > drive_start else None,
             cpu_usage_percent=self._fresh("cpu_usage", event_t),
             memory_used_percent=self._fresh("memory", event_t),
             disk_used_percent=self._fresh("disk", event_t),
@@ -336,22 +357,16 @@ def _value_with_unit(r: Any, value: str, unit: str, x: float, cy: float, size: f
         r._draw_text(unit, left + value_w + gap, cy + (size - unit_size) * 0.3, unit_size, DIM, "left")
 
 
-def _draw_arrow(x: float, y: float, w: float, h: float, left: bool, lit: bool) -> None:
+def _draw_signal(x: float, y: float, w: float, h: float, left: bool, lit: bool) -> None:
+    """Turn signal: a plain triangle, kept small so the driving band stays uncluttered."""
     color = _c(BLINK_COLOR) if lit else _c(FAINT)
-    kx, ky = w / 90.0, h / 120.0
-
-    def px(u: float) -> float:
-        return x + u * kx if left else x + w - u * kx
-
-    tip = rl.Vector2(px(0), y + 60 * ky)
-    top = rl.Vector2(px(58), y)
-    bottom = rl.Vector2(px(58), y + h)
+    tip = rl.Vector2(x if left else x + w, y + h * 0.5)
+    top = rl.Vector2(x + w if left else x, y)
+    bottom = rl.Vector2(x + w if left else x, y + h)
     if left:
         rl.draw_triangle(top, tip, bottom, color)
     else:
         rl.draw_triangle(top, bottom, tip, color)
-    tail_x = min(px(58), px(90))
-    rl.draw_rectangle_rec(rl.Rectangle(tail_x, y + 34 * ky, 32 * kx, 52 * ky), color)
 
 
 def _draw_wifi(cx: float, cy: float, connected: bool) -> None:
@@ -360,9 +375,7 @@ def _draw_wifi(cx: float, cy: float, connected: bool) -> None:
     center = rl.Vector2(cx, cy)
     for radius in (9.0, 17.0):
         rl.draw_ring(center, radius, radius + 3.5, 225.0, 315.0, 16, color)
-    rl.draw_circle_v(center, 3.5, color)
-    if not connected:
-        rl.draw_line_ex(rl.Vector2(cx - 15, cy + 3), rl.Vector2(cx + 15, cy - 23), 3.0, _c(BRAKE_COLOR))
+    rl.draw_circle_v(center, 3.5, color)  # disconnected simply stays grey, no slash
 
 
 def _fmt(value: float | None, digits: int = 0) -> str:
@@ -380,8 +393,8 @@ ENGINE_PANEL_FILL = (46, 31, 9)
 
 def _draw_top_band(r: Any, state: Any, snap: MyHudSnapshot, signal_lights: tuple[bool, bool]) -> None:
     left_lit, right_lit = signal_lights
-    _draw_arrow(26, 96, 80, 110, True, left_lit)
-    _draw_arrow(1814, 96, 80, 110, False, right_lit)
+    _draw_signal(26, 96, 48, 110, True, left_lit)
+    _draw_signal(1846, 96, 48, 110, False, right_lit)
 
     # The whole gear/RPM block is tinted by powertrain state so EV vs engine reads at a glance.
     engine_running = snap.engine_running
@@ -389,35 +402,35 @@ def _draw_top_band(r: Any, state: Any, snap: MyHudSnapshot, signal_lights: tuple
         accent = DIM
     else:
         accent = ENGINE_COLOR if engine_running else EV_COLOR
-        _rounded(118, 30, 634, 254, 22, ENGINE_PANEL_FILL if engine_running else EV_PANEL_FILL, accent, 3)
+        _rounded(110, 30, 642, 254, 22, ENGINE_PANEL_FILL if engine_running else EV_PANEL_FILL, accent, 3)
 
     gear = str(getattr(state, "gear_text", "") or "").strip() or "--"
-    _rounded(140, 52, 100, 100, 18, None, FAINT if engine_running is None else DIM, 3)
-    r._draw_text(gear, 190, 102, 70, INK, "center")
+    _rounded(134, 52, 100, 100, 18, None, FAINT if engine_running is None else DIM, 3)
+    r._draw_text(gear, 184, 102, 70, INK, "center")
     mode_text = "--" if engine_running is None else ("ENGINE" if engine_running else "EV")
-    r._draw_text(mode_text, 190, 214, 30, accent, "center")
+    r._draw_text(mode_text, 184, 214, 30, accent, "center")
 
     if engine_running is False:
         soc = snap.hv_soc_percent
         if soc is None:
-            r._draw_text("엔진 정지", 300, 58, 24, EV_COLOR, "left")
-            r._draw_text("EV", 296, 150, 150, EV_COLOR, "left")
+            r._draw_text("엔진 정지", 294, 58, 24, EV_COLOR, "left")
+            r._draw_text("EV", 290, 150, 150, EV_COLOR, "left")
         else:
             # RPM is 0 while the engine is off; the HV battery is the number worth watching.
-            r._draw_text("고전압 배터리", 300, 58, 24, EV_COLOR, "left")
-            _value_with_unit(r, f"{soc:.0f}", "%", 300, 142, 124, EV_COLOR, 44)
-            _hbar(300, 222, 430, 18, soc / 100.0, EV_COLOR)
-            r._draw_text("0", 300, 257, 18, DIM, "left")
-            r._draw_text("50", 515, 257, 18, DIM, "center")
+            r._draw_text("고전압 배터리", 294, 58, 24, EV_COLOR, "left")
+            _value_with_unit(r, f"{soc:.0f}", "%", 294, 142, 124, EV_COLOR, 44)
+            _hbar(294, 222, 436, 18, soc / 100.0, EV_COLOR)
+            r._draw_text("0", 294, 257, 18, DIM, "left")
+            r._draw_text("50", 512, 257, 18, DIM, "center")
             r._draw_text("100%", 730, 257, 18, DIM, "right")
     else:
         rpm = snap.engine_rpm
-        r._draw_text("RPM", 300, 58, 24, accent, "left")
-        r._draw_text("--" if rpm is None else f"{rpm:,.0f}", 300, 142, 124, FAINT if rpm is None else INK, "left")
-        _hbar(300, 222, 430, 18, (rpm or 0.0) / RPM_BAR_MAX, ENGINE_COLOR)
-        r._draw_text("0", 300, 257, 18, DIM, "left")
-        r._draw_text("2k", 443, 257, 18, DIM, "center")
-        r._draw_text("4k", 587, 257, 18, DIM, "center")
+        r._draw_text("RPM", 294, 58, 24, accent, "left")
+        r._draw_text("--" if rpm is None else f"{rpm:,.0f}", 294, 142, 124, FAINT if rpm is None else INK, "left")
+        _hbar(294, 222, 436, 18, (rpm or 0.0) / RPM_BAR_MAX, ENGINE_COLOR)
+        r._draw_text("0", 294, 257, 18, DIM, "left")
+        r._draw_text("2k", 439, 257, 18, DIM, "center")
+        r._draw_text("4k", 585, 257, 18, DIM, "center")
         r._draw_text("6k", 730, 257, 18, DIM, "right")
 
     for tile in TOP_DIVIDER_TILES:
@@ -442,14 +455,32 @@ def _draw_top_band(r: Any, state: Any, snap: MyHudSnapshot, signal_lights: tuple
         _value_with_unit(r, f"{distance:.1f}" if distance < 100 else f"{distance:.0f}", "m" if metric else "ft",
                          1184, 159, 118, INK, 36)
 
+    # Three fixed-colour bars instead of one brake box that changes colour: accel, regen, hydraulic.
+    # While cruise drives, the pedal reads zero, so the accel bar shows the requested acceleration.
     gas = snap.gas_percent
-    _vbar(1566, 46, 62, 190, (gas or 0.0) / 100.0, GAS_COLOR)
     pressure = snap.brake_pressure_bar
-    _vbar(1690, 46, 62, 190, (pressure or 0.0) / BRAKE_BAR_MAX, BRAKE_COLOR)
-    if snap.brake_pressed:
-        _rounded(1684, 40, 74, 202, 11, None, BRAKE_COLOR, 3)
-    r._draw_text(f"가속 {_fmt(gas)}%", 1597, 263, 22, DIM, "center")
-    r._draw_text(f"제동 {_fmt(pressure, 1)}", 1721, 263, 22, BRAKE_COLOR if snap.brake_pressed else DIM, "center")
+    regen = abs(snap.decel_mps2 or 0.0) / REGEN_BAR_MAX_MPS2 if snap.regen_charging else 0.0
+    cruise_mode = str(getattr(state, "cruise_display_state", "off") or "off")
+    requested = _finite(getattr(state, "planned_accel_mps2", None))
+    if cruise_mode == "engaged" and requested is not None:
+        accel_fraction, accel_label = max(0.0, requested) / CRUISE_ACCEL_MAX_MPS2, f"요청 {max(0.0, requested):.1f}"
+    else:
+        accel_fraction, accel_label = (gas or 0.0) / 100.0, f"가속 {_fmt(gas)}%"
+    bars = (
+        (1544, accel_label, accel_fraction, GAS_COLOR),
+        (1644, "회생", regen, REGEN_COLOR),
+        (1744, f"유압 {_fmt(pressure, 1)}", (pressure or 0.0) / BRAKE_BAR_MAX, BRAKE_COLOR),
+    )
+    for x, label, fraction, color in bars:
+        _vbar(x, 42, 64, 172, fraction, color)
+        active = fraction > 0.0  # the active bar lights its own outline; idle bars stay grey
+        _rounded(x - 6, 36, 76, 184, 11, None, color if active else BAR_OUTLINE, 3)  # sits outside the bar
+        r._draw_text(label, x + 32, 238, 20, color if active else DIM, "center")
+
+    # Same badge wording as ENGINE/EV above: who is working the pedals right now.
+    # "paused" means a set speed exists but cruise is not driving, so the pedals are the driver's.
+    cruise_text, cruise_color = ("CRUISE", SET_COLOR) if cruise_mode == "engaged" else ("MANUAL", DIM)
+    r._draw_text(cruise_text, 1676, 274, 26, cruise_color, "center")
 
 
 STATUS_TILE_X0 = 30
@@ -512,12 +543,19 @@ def _draw_status_row(r: Any, state: Any, snap: MyHudSnapshot) -> None:
 
     metric_tile(2, "고전압 배터리", snap.hv_soc_percent, "%")
     metric_tile(3, "12V 전압", snap.battery_voltage_v, "V", 1)
-    metric_tile(4, "CPU 온도", cpu_temp, "°C", 0, cpu_temp_color)
-    metric_tile(5, "GPU 온도", snap.gpu_temp_c, "°C")
+    # Fan rpm in thousands: 1986 -> "1.99" with a small "k" unit like the other tiles.
+    metric_tile(4, "팬 rpm", None if snap.fan_rpm is None else snap.fan_rpm / 1000.0, "k", 2)
+    metric_tile(5, "CPU 온도", cpu_temp, "°C", 0, cpu_temp_color)
     metric_tile(6, "CPU 사용", snap.cpu_usage_percent, "%")
     metric_tile(7, "메모리", snap.memory_used_percent, "%")
     metric_tile(8, "저장소", snap.disk_used_percent, "%")
-    metric_tile(9, "전력", snap.power_draw_w, "W", 1)
+    drive = snap.drive_seconds
+    tx = tile_x(9)
+    r._draw_text("주행 시간", tx, STATUS_LABEL_Y, 21, DIM, "left")
+    if drive is None:
+        r._draw_text("--", tx, STATUS_VALUE_Y, STATUS_VALUE_SIZE, FAINT, "left")
+    else:
+        r._draw_text(f"{int(drive // 3600)}:{int(drive // 60) % 60:02d}", tx, STATUS_VALUE_Y, STATUS_VALUE_SIZE, INK, "left")
 
     # Wi-Fi is only a small glyph at the right end of the label line.
     _draw_wifi(STATUS_TILE_X0 + 10 * STATUS_TILE_W - 22, 346, bool(getattr(state, "network_connected", False)))
